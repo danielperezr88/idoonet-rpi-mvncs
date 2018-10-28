@@ -1,0 +1,9 @@
+*.tar.gz
+*.pb
+*.npy
+*.pyd
+models/*.index
+models/*.meta
+models/*data-00000-of-00001
+*.egg-info
+build/
