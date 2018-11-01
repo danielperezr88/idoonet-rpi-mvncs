@@ -13,8 +13,18 @@ from tf_pose.common import CocoPart
 from tf_pose.tensblur.smoother import Smoother
 
 try:
+	import mvnc.mvncapi as mvnc
+	devices = mvnc.enumerate_devices()
+	if len(devices) == 0:
+		print("No devices found")
+		quit()
+except ImportError as e:
+	print("No mvnc libraries found...")
+	mvnc = None
+
+try:
     from tf_pose.pafprocess import pafprocess
-except ModuleNotFoundError as e:
+except ImportError as e:
     print(e)
     print('you need to build c++ library for pafprocess. See : https://github.com/ildoonet/tf-pose-estimation/tree/master/tf_pose/pafprocess')
     exit(-1)
@@ -296,28 +306,179 @@ class PoseEstimator:
 
         return humans
 
+class AgnosticInferenceObject:
+    def __init__(self, blob, target_size=(224, 224), tf_config=None, is_mvnc=False): # earlier target_size=(320,240)
+        if is_mvnc:
+            if mvnc is None:
+                print("Please install MVNC libraries to use --is-mvnc option...")
+                quit(-1)
+            self.device = mvnc.Device(devices[0])
+            self.device.openDevice()
+            self.obj = self.device.AllocateGraph(blob)
+            self.graph = tf.get_default_graph()
+            self.persistent_sess = tf.Session(graph=self.graph, config=tf_config)
+            self.tensor_image = None
+            self.tensor_output = tf.placeholder(tf.float16, shape=(1, target_size[0] // 8, target_size[1] // 8, 57), name='vectmap') #57?
+        else:
+            self.device = None
+            graph_def = tf.GraphDef()
+            graph_def.ParseFromString(blob)
+            self.graph = tf.get_default_graph()
+            tf.import_graph_def(graph_def, name='TfPoseEstimator')
+            self.obj = self.persistent_sess = tf.Session(graph=self.graph, config=tf_config)
+            try:
+                self.tensor_image = self.graph.get_tensor_by_name('TfPoseEstimator/image:0')
+            except KeyError as e:
+                self.tensor_image = self.graph.get_tensor_by_name('TfPoseEstimator/split:0')
+            try:
+                self.tensor_output = self.graph.get_tensor_by_name('Openpose/concat_stage7:0')
+            except KeyError as e:
+                self.tensor_output = self.graph.get_tensor_by_name('TfPoseEstimator/Openpose/concat_stage7:0')
+        
+        # for op in self.graph.get_operations():
+        #     print(op.name)
+        
+        # for ts in [n.name for n in tf.get_default_graph().as_graph_def().node]:
+        #     print(ts)
+            
+        self.tensor_heatMat = self.tensor_output[:, :, :, :19]
+        self.tensor_pafMat = self.tensor_output[:, :, :, 19:]
+        self.upsample_size = tf.placeholder(dtype=tf.int32, shape=(2,), name='upsample_size')
+        self.tensor_heatMat_up = tf.image.resize_area(self.tensor_output[:, :, :, :19], self.upsample_size,
+                                                      align_corners=False, name='upsample_heatmat')
+        self.tensor_pafMat_up = tf.image.resize_area(self.tensor_output[:, :, :, 19:], self.upsample_size,
+                                                     align_corners=False, name='upsample_pafmat')
+        smoother = Smoother({'data': self.tensor_heatMat_up}, 25, 3.0)
+        gaussian_heatMat = smoother.get_output()
+        
+        max_pooled_in_tensor = tf.nn.pool(gaussian_heatMat, window_shape=(3, 3), pooling_type='MAX', padding='SAME')
+        self.tensor_peaks = tf.where(tf.equal(gaussian_heatMat, max_pooled_in_tensor), gaussian_heatMat,
+                                     tf.zeros_like(gaussian_heatMat))
+
+        self.heatMat = self.pafMat = None
+
+        # warm-up
+        if is_mvnc:
+            self.persistent_sess.run(tf.variables_initializer(
+                [v for v in tf.global_variables() if
+                 v.name.split(':')[0] in [x.decode('utf-8') for x in
+                                          self.persistent_sess.run(tf.report_uninitialized_variables())]
+                 ])
+            )
+            self.persistent_sess.run(
+                [self.tensor_peaks, self.tensor_heatMat_up, self.tensor_pafMat_up],
+                feed_dict={
+                    self.tensor_output: [np.ndarray(shape=(target_size[1] // 8, target_size[0] // 8, 57), dtype=np.float16)],
+                    self.upsample_size: [target_size[1], target_size[0]]#[target_size[1] // 8, target_size[0] // 8]
+                }
+            )
+            self.persistent_sess.run(
+                [self.tensor_peaks, self.tensor_heatMat_up, self.tensor_pafMat_up],
+                feed_dict={
+                    self.tensor_output: [np.ndarray(shape=(target_size[1] // 8, target_size[0] // 8, 57), dtype=np.float16)],
+                    self.upsample_size: [target_size[1] // 2, target_size[0] // 2]#[target_size[1] // 16, target_size[0] // 16]
+                }
+            )
+            self.persistent_sess.run(
+                [self.tensor_peaks, self.tensor_heatMat_up, self.tensor_pafMat_up],
+                feed_dict={
+                    self.tensor_output: [np.ndarray(shape=(target_size[1] // 8, target_size[0] // 8, 57), dtype=np.float16)],
+                    self.upsample_size: [target_size[1] // 4, target_size[0] // 4]#[target_size[1] // 32, target_size[0] // 32]
+                }
+            )
+            
+        else:
+            self.persistent_sess.run(tf.variables_initializer(
+                [v for v in tf.global_variables() if
+                 v.name.split(':')[0] in [x.decode('utf-8') for x in
+                                          self.persistent_sess.run(tf.report_uninitialized_variables())]
+                 ])
+            )
+            self.persistent_sess.run(
+                [self.tensor_peaks, self.tensor_heatMat_up, self.tensor_pafMat_up],
+                feed_dict={
+                    self.tensor_image: [np.ndarray(shape=(target_size[1], target_size[0], 3), dtype=np.float32)],
+                    self.upsample_size: [target_size[1], target_size[0]]
+                }
+            )
+            self.persistent_sess.run(
+                [self.tensor_peaks, self.tensor_heatMat_up, self.tensor_pafMat_up],
+                feed_dict={
+                    self.tensor_image: [np.ndarray(shape=(target_size[1], target_size[0], 3), dtype=np.float32)],
+                    self.upsample_size: [target_size[1] // 2, target_size[0] // 2]
+                }
+            )
+            self.persistent_sess.run(
+                [self.tensor_peaks, self.tensor_heatMat_up, self.tensor_pafMat_up],
+                feed_dict={
+                    self.tensor_image: [np.ndarray(shape=(target_size[1], target_size[0], 3), dtype=np.float32)],
+                    self.upsample_size: [target_size[1] // 4, target_size[0] // 4]
+                }
+            )
+        
+        self.is_mvnc = is_mvnc
+    
+    def inference(self, img, upsample_size=1.0):
+        if self.is_mvnc:
+            self.obj.LoadTensor( img.astype( np.float16 ), 'user object' )
+            output, userobj = self.obj.GetResult()
+            self.persistent_sess.run(
+                [self.tensor_peaks, self.tensor_heatMat_up, self.tensor_pafMat_up],
+                feed_dict={
+                    self.tensor_output: [output],
+                    self.upsample_size: upsample_size# // 8
+                }
+            )
+        else:
+            peaks, heatMat_up, pafMat_up = self.persistent_sess.run(
+                [self.tensor_peaks, self.tensor_heatMat_up, self.tensor_pafMat_up], feed_dict={
+                    self.tensor_image: [img], self.upsample_size: upsample_size
+                })
+        peaks = peaks[0]
+        self.heatMat = heatMat_up[0]
+        self.pafMat = pafMat_up[0]
+        logger.debug('inference- heatMat=%dx%d pafMat=%dx%d' % (
+            self.heatMat.shape[1], self.heatMat.shape[0], self.pafMat.shape[1], self.pafMat.shape[0]))
+        
+        t = time.time()
+        humans = PoseEstimator.estimate_paf(peaks, self.heatMat, self.pafMat)
+        logger.debug('estimate time=%.5f' % (time.time() - t))
+        return humans
+
 
 class TfPoseEstimator:
     # TODO : multi-scale
 
-    def __init__(self, graph_path, target_size=(320, 240), tf_config=None):
+    def __init__(self, graph_path, target_size=(224, 224), tf_config=None, is_mvnc=False): # earlier target_size=(320,240)
+        
         self.target_size = target_size
-
+        
         # load graph
         logger.info('loading graph from %s(default size=%dx%d)' % (graph_path, target_size[0], target_size[1]))
         with tf.gfile.GFile(graph_path, 'rb') as f:
-            graph_def = tf.GraphDef()
-            graph_def.ParseFromString(f.read())
+            blob = f.read()
+        
+        self.inference_object = AgnosticInferenceObject(blob, target_size, tf_config, is_mvnc)
 
+        """
+        if is_mvnc:
+            device = mvnc.Device(devices[0])
+            device.openDevice()
+            graph = device.AllocateGraph(blob)
+        else:
+            graph = tf.GraphDef()
+            graph.ParseFromString(blob)
+            
         self.graph = tf.get_default_graph()
-        tf.import_graph_def(graph_def, name='TfPoseEstimator')
+        tf.import_graph_def(graph, name='TfPoseEstimator')
         self.persistent_sess = tf.Session(graph=self.graph, config=tf_config)
-
+        
         # for op in self.graph.get_operations():
         #     print(op.name)
-        for ts in [n.name for n in tf.get_default_graph().as_graph_def().node]:
-            print(ts)
-
+        
+        # for ts in [n.name for n in tf.get_default_graph().as_graph_def().node]:
+        #     print(ts)
+        
         try:
             self.tensor_image = self.graph.get_tensor_by_name('TfPoseEstimator/image:0')
         except KeyError as e:
@@ -371,6 +532,7 @@ class TfPoseEstimator:
                 self.upsample_size: [target_size[1] // 4, target_size[0] // 4]
             }
         )
+        """
 
     def __del__(self):
         # self.persistent_sess.close()
@@ -566,29 +728,18 @@ class TfPoseEstimator:
         else:
             upsample_size = [int(npimg.shape[0] / 8 * upsample_size), int(npimg.shape[1] / 8 * upsample_size)]
 
-        if self.tensor_image.dtype == tf.quint8:
-            # quantize input image
-            npimg = TfPoseEstimator._quantize_img(npimg)
-            pass
+        if self.inference_object.tensor_image is not None:
+            if self.inference_object.tensor_image.dtype == tf.quint8:
+                # quantize input image
+                npimg = TfPoseEstimator._quantize_img(npimg)
+                pass
 
         logger.debug('inference+ original shape=%dx%d' % (npimg.shape[1], npimg.shape[0]))
         img = npimg
         if resize_to_default:
             img = self._get_scaled_img(npimg, None)[0][0]
-        peaks, heatMat_up, pafMat_up = self.persistent_sess.run(
-            [self.tensor_peaks, self.tensor_heatMat_up, self.tensor_pafMat_up], feed_dict={
-                self.tensor_image: [img], self.upsample_size: upsample_size
-            })
-        peaks = peaks[0]
-        self.heatMat = heatMat_up[0]
-        self.pafMat = pafMat_up[0]
-        logger.debug('inference- heatMat=%dx%d pafMat=%dx%d' % (
-            self.heatMat.shape[1], self.heatMat.shape[0], self.pafMat.shape[1], self.pafMat.shape[0]))
 
-        t = time.time()
-        humans = PoseEstimator.estimate_paf(peaks, self.heatMat, self.pafMat)
-        logger.debug('estimate time=%.5f' % (time.time() - t))
-        return humans
+        return self.inference_object.inference(img, upsample_size)
 
 
 if __name__ == '__main__':

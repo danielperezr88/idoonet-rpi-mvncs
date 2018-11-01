@@ -2,13 +2,9 @@
 import argparse
 import logging
 import time
-import mvnc.mvncapi as mvnc
 
 import cv2
 import numpy as np
-
-from picamera.array import PiRGBArray
-from picamera import PiCamera
 
 from tf_pose.estimator import TfPoseEstimator
 from tf_pose.common import CocoPairs, CocoPart
@@ -27,13 +23,6 @@ formatter = logging.Formatter('[%(asctime)s] [%(name)s] [%(levelname)s] %(messag
 ch.setFormatter(formatter)
 logger.addHandler(ch)
 
-devices = mvnc.EnumerateDevices()
-if len(devices) == 0:
-    print("No devices found")
-    quit()
-
-device = mvnc.Device(devices[0])
-device.openDevice()
 
 """
 class VideoStream:
@@ -177,6 +166,7 @@ if __name__ == '__main__':
                         help='if provided, resize heatmaps before they are post-processed. default=1.0')
 
     parser.add_argument('--model', type=str, default='mobilenet_thin', help='cmu / mobilenet_thin')
+    parser.add_argument('--is-mvnc', action="store_true")
     parser.add_argument('--is-banisters', action="store_true")
     parser.add_argument('--show-process', type=bool, default=False,
                         help='for debug purpose, if enabled, speed for inference is dropped.')
@@ -185,6 +175,10 @@ if __name__ == '__main__':
     logger.debug('cam read+')
     camera = None
     if args.use_picamera:
+
+        from picamera.array import PiRGBArray
+        from picamera import PiCamera
+
         size = model_wh(args.input_resolution)
         camera = PiCamera()
         camera.resolution = size
@@ -226,12 +220,9 @@ if __name__ == '__main__':
     logger.debug('initialization %s : %s' % (args.model, get_graph_path(args.model)))
     w, h = model_wh(args.resize)
     if w > 0 and h > 0:
-        # e = TfPoseEstimator(get_graph_path(args.model), target_size=(w, h))
-        with open(get_graph_path(args.model), 'rb') as fp:
-            blob = fp.read()
-        graph = device.AllocateGraph(blob)
+        e = TfPoseEstimator(get_graph_path(args.model), target_size=(w, h), is_mvnc=args.is_mvnc)        
     else:
-        e = TfPoseEstimator(get_graph_path(args.model), target_size=(432, 368))
+        e = TfPoseEstimator(get_graph_path(args.model), target_size=(432, 368), is_mvnc=args.is_mvnc)
     
     logger.info('cam image=%dx%d' % (image.shape[1], image.shape[0]))
 
@@ -265,7 +256,7 @@ if __name__ == '__main__':
             image = TfPoseEstimator.draw_humans(image, humans, imgcopy=False)
         
         to_add = np.zeros_like(image, dtype=np.uint8)
-        tmp2 = np.amax(np.absolute(e.pafMat.transpose((2, 0, 1))), axis=0)
+        tmp2 = np.amax(np.absolute(e.inference_object.pafMat.transpose((2, 0, 1))), axis=0)
         tmp2 = cv2.resize(tmp2, (image.shape[1], image.shape[0]), interpolation=cv2.INTER_AREA)
         
         to_add[:,:,0] = tmp2*255
