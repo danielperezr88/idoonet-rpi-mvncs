@@ -1,3 +1,9 @@
+# Handrail advisor:
+
+On-site human pose tracking camera for improved worker security
+
+<!--
+
 # tf-pose-estimation
 
 'Openpose' for human pose estimation have been implemented using Tensorflow. It also provides several variants that have made some changes to the network structure for **real-time processing on the CPU or low-power embedded devices.**
@@ -199,3 +205,4 @@ See : [etcs/training.md](./etcs/training.md)
 [1] Freeze graph : https://github.com/tensorflow/tensorflow/blob/master/tensorflow/python/tools/freeze_graph.py
 
 [2] Optimize graph : https://codelabs.developers.google.com/codelabs/tensorflow-for-poets-2
+-->
